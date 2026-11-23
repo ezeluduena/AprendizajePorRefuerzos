@@ -10,7 +10,7 @@ import pandas as pd
 import numpy as np
 import torch
 
-from modelos.dt import DecisionTransformer, dt_loss
+from modelos.dt import DecisionTransformer, dt_loss, masked_action_loss
 from protocolo.datos import Episodes, load_train, make_episodes, num_items, split_by_user
 
 
@@ -58,6 +58,7 @@ def train_dt(
     dropout: float = 0.1,
     max_batches: int | None = None,
     device: str | torch.device = "cpu",
+    amp: bool = False,
     output: str | Path | None = None,
     verbose: bool = True,
 ):
@@ -78,6 +79,8 @@ def train_dt(
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    use_amp = bool(amp and torch.cuda.is_available() and torch.device(device).type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     n_episodes = train_data["items"].shape[0]
     steps_per_epoch = max(1, (n_episodes + batch_size - 1) // batch_size)
     if max_batches is not None:
@@ -99,6 +102,8 @@ def train_dt(
         "lr": lr,
         "weight_decay": weight_decay,
         "group_dropout": group_dropout,
+        "amp": use_amp,
+        "device": str(device),
     }
 
     history = []
@@ -122,11 +127,18 @@ def train_dt(
                     torch.full_like(batch["groups"], model.n_groups),
                     batch["groups"],
                 )
-            loss = dt_loss(model, batch)
+            if use_amp:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    logits = model(batch["rtg"], batch["items"], batch["state"], batch["groups"])
+                loss = masked_action_loss(logits, batch["items"])
+            else:
+                loss = dt_loss(model, batch)
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             running += loss.item()
             batches += 1
@@ -196,8 +208,16 @@ def main() -> None:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--group-dropout", type=float, default=0.3)
     parser.add_argument("--max-batches", type=int, default=None)
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--amp", action="store_true")
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
+
+    device = (
+        "cuda" if args.device == "auto" and torch.cuda.is_available()
+        else "cpu" if args.device == "auto"
+        else args.device
+    )
 
     train_all = load_train(args.dataset)
     train, val = split_by_user(train_all)
@@ -219,9 +239,11 @@ def main() -> None:
         dropout=args.dropout,
         group_dropout=args.group_dropout,
         max_batches=args.max_batches,
+        device=device,
+        amp=args.amp,
         output=output,
     )
-    print(f"mejor val CE: {best_val:.4f} | referencia uniforme log(n_items) ≈ 6.62")
+    print(f"mejor val CE: {best_val:.4f} | referencia uniforme log(n_items) ≈ {np.log(num_items(args.dataset)):.2f}")
 
 
 if __name__ == "__main__":

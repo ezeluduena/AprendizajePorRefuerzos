@@ -99,10 +99,15 @@ def seen_before_mask(items: torch.Tensor, n_items: int) -> torch.Tensor:
     return torch.cat([torch.zeros_like(seen[:, :1]), seen[:, :-1]], dim=1)
 
 
+def masked_action_loss(logits: torch.Tensor, items: torch.Tensor) -> torch.Tensor:
+    logits = logits.float()
+    logits = logits.masked_fill(seen_before_mask(items, logits.shape[-1]), float("-inf"))
+    return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), items.reshape(-1))
+
+
 def dt_loss(model, batch) -> torch.Tensor:
     logits = model(batch["rtg"], batch["items"], batch["state"], batch["groups"])
-    logits = logits.masked_fill(seen_before_mask(batch["items"], logits.shape[-1]), float("-inf"))
-    return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), batch["items"].reshape(-1))
+    return masked_action_loss(logits, batch["items"])
 
 
 def check_no_leak(model: DecisionTransformer, batch, t: int = 7, atol: float = 1e-5) -> bool:
