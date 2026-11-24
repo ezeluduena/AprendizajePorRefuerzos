@@ -254,7 +254,10 @@ def train_iql(
         [p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=weight_decay
     )
     use_amp = bool(amp and torch.cuda.is_available() and torch.device(device).type == "cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    use_bf16 = bool(use_amp and torch.cuda.is_bf16_supported())
+    use_fp16 = bool(use_amp and not use_bf16)
+    amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
 
     n_episodes = train_data["items"].shape[0]
     steps_per_epoch = max(1, (n_episodes + batch_size - 1) // batch_size)
@@ -280,6 +283,7 @@ def train_iql(
         "group_dropout": group_dropout,
         "target_lambda": target_lambda,
         "amp": use_amp,
+        "amp_dtype": "bf16" if use_bf16 else ("fp16" if use_fp16 else None),
         "device": str(device),
         **loss_kwargs,
     }
@@ -305,19 +309,27 @@ def train_iql(
                 )
 
             if use_amp:
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                with torch.autocast(device_type="cuda", dtype=amp_dtype):
                     losses = iql_losses(model, batch, **loss_kwargs)
             else:
                 losses = iql_losses(model, batch, **loss_kwargs)
             loss = losses["v"] + losses["q"] + losses["pi"]
 
             optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+            if use_fp16:
+                scale_before = scaler.get_scale()
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                if scaler.get_scale() >= scale_before:
+                    scheduler.step()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
+                scheduler.step()
             model.update_target(target_lambda)
 
             weights = losses["weights"]
