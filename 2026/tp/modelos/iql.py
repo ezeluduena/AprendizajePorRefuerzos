@@ -416,3 +416,36 @@ class IQLPolicy:
         out = network(items, ratings, groups)[0, t].clone()
         out[items_seen] = float("-inf")
         return out.cpu().numpy()
+
+    @torch.no_grad()
+    def scores_batch(self, items_seen, ratings_seen, groups):
+        batch_size = len(items_seen)
+        if batch_size == 0:
+            return np.zeros((0, self.model.n_items), dtype=np.float32)
+        lengths = {len(seen) for seen in items_seen}
+        if len(lengths) != 1:
+            raise ValueError("Las historias del batch deben tener el mismo largo")
+        t = lengths.pop()
+        items_arr = (
+            np.stack([np.asarray(x, dtype=np.int64) for x in items_seen])
+            if t else np.zeros((batch_size, 0), dtype=np.int64)
+        )
+        ratings_arr = (
+            np.stack([np.asarray(x, dtype=np.float32) for x in ratings_seen])
+            if t else np.zeros((batch_size, 0), dtype=np.float32)
+        )
+        groups_arr = np.array(
+            [self.model.n_groups if g is None else int(g) for g in groups], dtype=np.int64
+        )
+        device = next(self.model.parameters()).device
+        network = self.model.pi if self.mode == "pi" else self.model.q
+        out = network(
+            torch.as_tensor(items_arr, device=device),
+            torch.as_tensor(ratings_arr, device=device),
+            torch.as_tensor(groups_arr, device=device),
+        )[:, t].cpu().numpy()
+        for row, seen in enumerate(items_seen):
+            seen = np.asarray(seen, dtype=np.int64)
+            if len(seen):
+                out[row, seen] = -np.inf
+        return out

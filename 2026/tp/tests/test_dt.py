@@ -102,3 +102,20 @@ def test_prediction_uses_current_state():
         state2[:, 5] += 2.5
         out = model(batch["rtg"], batch["items"], state2, batch["groups"])[:, 5]
     assert not torch.allclose(base, out)
+
+
+def test_policy_scores_batch_matches_scores():
+    model = make_model()
+    batch = make_batch()
+    groups = batch["groups"].tolist()
+    policy = DTPolicy(model, target_return=80.0)
+    for t in (0, 5, 19):
+        items_seen = [batch["items"][i, :t].numpy() for i in range(batch["items"].shape[0])]
+        ratings_seen = [batch["state"][i, 1 : t + 1].numpy() for i in range(batch["state"].shape[0])]
+        batched = policy.scores_batch(items_seen, ratings_seen, groups)
+        for i in range(len(items_seen)):
+            policy.reset(groups[i], 20)
+            single = policy.scores(items_seen[i], ratings_seen[i])
+            finite = np.isfinite(single)
+            assert np.array_equal(finite, np.isfinite(batched[i]))
+            assert np.allclose(single[finite], batched[i][finite], atol=1e-3, rtol=1e-4)

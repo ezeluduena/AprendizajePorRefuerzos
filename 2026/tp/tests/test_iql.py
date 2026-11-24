@@ -166,3 +166,22 @@ def test_train_and_load_smoke(tmp_path):
             21,
             50,
         )
+
+
+def test_policy_scores_batch_matches_scores():
+    model = make_small_iql()
+    batch = make_iql_batch()
+    groups = batch["groups"].tolist()
+    items, ratings = batch["items"], batch["ratings"]
+    for mode in ("pi", "q"):
+        policy = IQLPolicy(model, mode)
+        for t in (0, 5, 19):
+            items_seen = [items[i, :t].numpy() for i in range(items.shape[0])]
+            ratings_seen = [ratings[i, :t].numpy() for i in range(ratings.shape[0])]
+            batched = policy.scores_batch(items_seen, ratings_seen, groups)
+            for i in range(len(items_seen)):
+                policy.reset(groups[i], 20)
+                single = policy.scores(items_seen[i], ratings_seen[i])
+                finite = np.isfinite(single)
+                assert np.array_equal(finite, np.isfinite(batched[i]))
+                assert np.allclose(single[finite], batched[i][finite], atol=1e-3, rtol=1e-4)
